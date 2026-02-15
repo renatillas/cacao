@@ -1,4 +1,4 @@
-// Cocoa FFI — Physics world management, auto-discovery, Three.js sync, and raycasting.
+// Cacao FFI — Physics world management, auto-discovery, Three.js sync, and raycasting.
 //
 // Registries (_bodyRegistry, _colliderRegistry, _colliderToMeshId) are stored
 // as JS Maps directly on the Rapier world object for zero-cost per-frame access.
@@ -16,13 +16,11 @@ import {
 import {
   PhysicsWorld$PhysicsWorld,
   PhysicsWorld$PhysicsWorld$world,
-  PhysicsWorld$PhysicsWorld$collision_events,
   CollisionEvent$CollisionEvent,
   CollisionEventType$CollisionStarted,
   CollisionEventType$CollisionStopped,
   RayHit$RayHit,
-} from "./cocoa.mjs";
-
+} from "./cacao.mjs";
 // Rapier module — loaded dynamically
 let RAPIER = null;
 
@@ -51,7 +49,7 @@ export function init(gravity, callback) {
       const pw = PhysicsWorld$PhysicsWorld(world, toList([]));
       callback(pw);
     } catch (e) {
-      console.error("Cocoa: Failed to initialize Rapier:", e);
+      console.error("Cacao: Failed to initialize Rapier:", e);
     }
   })();
 }
@@ -147,7 +145,7 @@ export function resolveColliderToMesh(pw, colliderHandle) {
  * Cast a ray and return the closest hit with mesh ID resolved.
  */
 export function castRay(pw, originX, originY, originZ, dirX, dirY, dirZ, maxDistance) {
-  if (!RAPIER) return Option$None();
+  if (!RAPIER) return Result$Error();
 
   const world = PhysicsWorld$PhysicsWorld$world(pw);
   const ray = new RAPIER.Ray(
@@ -156,7 +154,7 @@ export function castRay(pw, originX, originY, originZ, dirX, dirY, dirZ, maxDist
   );
 
   const hit = world.castRay(ray, maxDistance, true);
-  if (hit === null || hit === undefined) return Option$None();
+  if (hit === null || hit === undefined) return Result$Error();
 
   // Compute hit point
   const point = ray.pointAt(hit.toi);
@@ -180,7 +178,7 @@ export function castRay(pw, originX, originY, originZ, dirX, dirY, dirZ, maxDist
     }
   }
 
-  return Option$Some(RayHit$RayHit(
+  return Result$Ok(RayHit$RayHit(
     [point.x, point.y, point.z],
     [normal.x, normal.y, normal.z],
     hit.toi,

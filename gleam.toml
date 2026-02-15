@@ -1,4 +1,4 @@
-name = "cocoa"
+name = "cacao"
 version = "1.0.0"
 target = "javascript"
 
@@ -10,3 +10,4 @@ vec = ">= 3.0.1 and < 4.0.0"
 gleam_time = ">= 1.6.0 and < 2.0.0"
 tiramisu = { path = "../tiramisu-workspaces/web-component" }
 estoque = { path = "../estoque" }
+quaterni = { path = "../quaterni" }

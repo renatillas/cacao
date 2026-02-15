@@ -1,4 +1,4 @@
-//// Cocoa - Physics add-on for Tiramisu.
+//// Cacao - Physics add-on for Tiramisu.
 ////
 //// Provides Rapier physics integration as a hybrid library:
 //// declarative physics attributes on meshes in the view, imperative core for
@@ -7,11 +7,11 @@
 //// ## Usage
 ////
 //// ```gleam
-//// import cocoa
+//// import cacao
 ////
 //// // In init — create the physics world
 //// fn init(_) {
-////   #(Model(physics: None), cocoa.init(#(0.0, -9.81, 0.0), PhysicsReady))
+////   #(Model(physics: None), cacao.init(#(0.0, -9.81, 0.0), PhysicsReady))
 //// }
 ////
 //// // In update — step physics on each tick
@@ -19,7 +19,7 @@
 ////   case msg {
 ////     PhysicsReady(world) -> #(Model(physics: Some(world)), effect.none())
 ////     Tick(_) -> {
-////       let world = cocoa.step(model.physics)
+////       let world = cacao.step(model.physics)
 ////       #(Model(..model, physics: world), effect.none())
 ////     }
 ////   }
@@ -30,8 +30,8 @@
 ////   renderer.renderer([...], [
 ////     mesh.mesh("player", [
 ////       mesh.geometry_box(vec3.Vec3(1.0, 1.0, 1.0)),
-////       cocoa.body_type(cocoa.Dynamic),
-////       cocoa.collider(cocoa.Cuboid(0.5, 0.5, 0.5)),
+////       cacao.body_type(cacao.Dynamic),
+////       cacao.collider(cacao.Cuboid(0.5, 0.5, 0.5)),
 ////     ], []),
 ////   ])
 //// }
@@ -40,13 +40,17 @@
 // IMPORTS ---------------------------------------------------------------------
 
 import estoque
+
 import gleam/bool
 import gleam/float
 import gleam/int
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{type Option, Some}
+
 import lustre/attribute.{type Attribute}
 import lustre/effect.{type Effect}
+
+import quaternion
 import vec/vec3
 
 // CORE TYPES ------------------------------------------------------------------
@@ -104,26 +108,14 @@ pub type ColliderShape {
 pub type RayHit {
   RayHit(
     /// World-space hit point.
-    point: #(Float, Float, Float),
+    point: vec3.Vec3(Float),
     /// Surface normal at the hit point.
-    normal: #(Float, Float, Float),
+    normal: vec3.Vec3(Float),
     /// Distance from the ray origin to the hit point.
     distance: Float,
     /// Mesh ID of the hit body, if it's registered in the body registry.
     mesh_id: Option(String),
   )
-}
-
-// ACCESSORS -------------------------------------------------------------------
-
-/// Get the estoque World from a PhysicsWorld.
-pub fn world(pw: PhysicsWorld) -> estoque.World {
-  pw.world
-}
-
-/// Get the collision events from the last step.
-pub fn collision_events(pw: PhysicsWorld) -> List(CollisionEvent) {
-  pw.collision_events
 }
 
 // INITIALIZATION --------------------------------------------------------------
@@ -134,15 +126,15 @@ pub fn collision_events(pw: PhysicsWorld) -> List(CollisionEvent) {
 /// once Rapier WASM finishes loading.
 ///
 pub fn init(
-  gravity: #(Float, Float, Float),
+  gravity: vec3.Vec3(Float),
   on_ready: fn(PhysicsWorld) -> msg,
 ) -> Effect(msg) {
   effect.from(fn(dispatch) {
-    do_init(gravity, fn(pw) { dispatch(on_ready(pw)) })
+    do_init(vec3.to_tuple(gravity), fn(pw) { dispatch(on_ready(pw)) })
   })
 }
 
-@external(javascript, "./cocoa.ffi.mjs", "init")
+@external(javascript, "./cacao.ffi.mjs", "init")
 fn do_init(
   gravity: #(Float, Float, Float),
   callback: fn(PhysicsWorld) -> Nil,
@@ -165,7 +157,7 @@ pub fn step(pw: PhysicsWorld) -> PhysicsWorld {
   do_step(pw)
 }
 
-@external(javascript, "./cocoa.ffi.mjs", "step")
+@external(javascript, "./cacao.ffi.mjs", "step")
 fn do_step(pw: PhysicsWorld) -> PhysicsWorld
 
 // BODY RESOLUTION -------------------------------------------------------------
@@ -174,7 +166,7 @@ fn do_step(pw: PhysicsWorld) -> PhysicsWorld
 ///
 /// Used internally by force, body, collision, and raycast functions.
 ///
-@external(javascript, "./cocoa.ffi.mjs", "resolveBody")
+@external(javascript, "./cacao.ffi.mjs", "resolveBody")
 pub fn resolve_body(
   pw: PhysicsWorld,
   mesh_id: String,
@@ -182,7 +174,7 @@ pub fn resolve_body(
 
 /// Resolve a collider handle to a mesh ID.
 ///
-@external(javascript, "./cocoa.ffi.mjs", "resolveColliderToMesh")
+@external(javascript, "./cacao.ffi.mjs", "resolveColliderToMesh")
 pub fn resolve_collider_to_mesh(
   pw: PhysicsWorld,
   collider_handle: Int,
@@ -322,11 +314,9 @@ pub fn collision_group(membership m: Int, filter f: Int) -> Attribute(msg) {
 pub fn apply_force(
   pw: PhysicsWorld,
   mesh_id: String,
-  fx: Float,
-  fy: Float,
-  fz: Float,
+  force: vec3.Vec3(Float),
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, fn(body) { estoque.apply_force(body, fx, fy, fz) })
+  with_body(pw, mesh_id, estoque.apply_force(_, force.x, force.y, force.z))
 }
 
 /// Apply an impulse to a body at its center of mass.
@@ -337,11 +327,14 @@ pub fn apply_force(
 pub fn apply_impulse(
   pw: PhysicsWorld,
   mesh_id: String,
-  ix: Float,
-  iy: Float,
-  iz: Float,
+  impulse: vec3.Vec3(Float),
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, fn(body) { estoque.apply_impulse(body, ix, iy, iz) })
+  with_body(pw, mesh_id, estoque.apply_impulse(
+    _,
+    impulse.x,
+    impulse.y,
+    impulse.z,
+  ))
 }
 
 /// Apply a torque (rotational force) to a body.
@@ -351,11 +344,9 @@ pub fn apply_impulse(
 pub fn apply_torque(
   pw: PhysicsWorld,
   mesh_id: String,
-  tx: Float,
-  ty: Float,
-  tz: Float,
+  torque: vec3.Vec3(Float),
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, fn(body) { estoque.apply_torque(body, tx, ty, tz) })
+  with_body(pw, mesh_id, estoque.apply_torque(_, torque.x, torque.y, torque.z))
 }
 
 /// Apply a torque impulse (instant angular velocity change) to a body.
@@ -363,13 +354,14 @@ pub fn apply_torque(
 pub fn apply_torque_impulse(
   pw: PhysicsWorld,
   mesh_id: String,
-  tx: Float,
-  ty: Float,
-  tz: Float,
+  torque_impulse: vec3.Vec3(Float),
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, fn(body) {
-    estoque.apply_torque_impulse(body, tx, ty, tz)
-  })
+  with_body(pw, mesh_id, estoque.apply_torque_impulse(
+    _,
+    torque_impulse.x,
+    torque_impulse.y,
+    torque_impulse.z,
+  ))
 }
 
 /// Apply a force at a specific world-space point on the body.
@@ -379,15 +371,19 @@ pub fn apply_torque_impulse(
 pub fn apply_force_at_point(
   pw: PhysicsWorld,
   mesh_id: String,
-  fx: Float,
-  fy: Float,
-  fz: Float,
-  px: Float,
-  py: Float,
-  pz: Float,
+  force force: vec3.Vec3(Float),
+  point point: vec3.Vec3(Float),
 ) -> Effect(msg) {
   with_body(pw, mesh_id, fn(body) {
-    estoque.apply_force_at_point(body, fx, fy, fz, px, py, pz)
+    estoque.apply_force_at_point(
+      body,
+      force.x,
+      force.y,
+      force.z,
+      point.x,
+      point.y,
+      point.z,
+    )
   })
 }
 
@@ -396,15 +392,19 @@ pub fn apply_force_at_point(
 pub fn apply_impulse_at_point(
   pw: PhysicsWorld,
   mesh_id: String,
-  ix: Float,
-  iy: Float,
-  iz: Float,
-  px: Float,
-  py: Float,
-  pz: Float,
+  impulse impulse: vec3.Vec3(Float),
+  point point: vec3.Vec3(Float),
 ) -> Effect(msg) {
   with_body(pw, mesh_id, fn(body) {
-    estoque.apply_impulse_at_point(body, ix, iy, iz, px, py, pz)
+    estoque.apply_impulse_at_point(
+      body,
+      impulse.x,
+      impulse.y,
+      impulse.z,
+      point.x,
+      point.y,
+      point.z,
+    )
   })
 }
 
@@ -418,12 +418,15 @@ pub fn apply_impulse_at_point(
 pub fn set_linear_velocity(
   pw: PhysicsWorld,
   mesh_id: String,
-  vx: Float,
-  vy: Float,
-  vz: Float,
+  linear_velocity: vec3.Vec3(Float),
 ) -> Effect(msg) {
   with_body(pw, mesh_id, fn(body) {
-    estoque.set_linear_velocity(body, vx, vy, vz)
+    estoque.set_linear_velocity(
+      body,
+      linear_velocity.x,
+      linear_velocity.y,
+      linear_velocity.z,
+    )
   })
 }
 
@@ -432,12 +435,15 @@ pub fn set_linear_velocity(
 pub fn set_angular_velocity(
   pw: PhysicsWorld,
   mesh_id: String,
-  vx: Float,
-  vy: Float,
-  vz: Float,
+  angular_velocity: vec3.Vec3(Float),
 ) -> Effect(msg) {
   with_body(pw, mesh_id, fn(body) {
-    estoque.set_angular_velocity(body, vx, vy, vz)
+    estoque.set_angular_velocity(
+      body,
+      angular_velocity.x,
+      angular_velocity.y,
+      angular_velocity.z,
+    )
   })
 }
 
@@ -451,11 +457,16 @@ pub fn set_angular_velocity(
 pub fn get_position(
   pw: PhysicsWorld,
   mesh_id: String,
-  to_msg: fn(#(Float, Float, Float)) -> msg,
+  to_msg: fn(vec3.Vec3(Float)) -> msg,
 ) -> Effect(msg) {
   effect.from(fn(dispatch) {
     case resolve_body(pw, mesh_id) {
-      Ok(body) -> dispatch(to_msg(estoque.get_translation(body)))
+      Ok(body) ->
+        body
+        |> estoque.get_translation
+        |> vec3.from_tuple
+        |> to_msg
+        |> dispatch
       Error(_) -> Nil
     }
   })
@@ -466,11 +477,16 @@ pub fn get_position(
 pub fn get_rotation(
   pw: PhysicsWorld,
   mesh_id: String,
-  to_msg: fn(#(Float, Float, Float, Float)) -> msg,
+  to_msg: fn(quaternion.Quaternion) -> msg,
 ) -> Effect(msg) {
   effect.from(fn(dispatch) {
     case resolve_body(pw, mesh_id) {
-      Ok(body) -> dispatch(to_msg(estoque.get_rotation(body)))
+      Ok(body) ->
+        body
+        |> estoque.get_rotation
+        |> quaternion.from_tuple
+        |> to_msg
+        |> dispatch
       Error(_) -> Nil
     }
   })
@@ -481,11 +497,16 @@ pub fn get_rotation(
 pub fn get_linear_velocity(
   pw: PhysicsWorld,
   mesh_id: String,
-  to_msg: fn(#(Float, Float, Float)) -> msg,
+  to_msg: fn(vec3.Vec3(Float)) -> msg,
 ) -> Effect(msg) {
   effect.from(fn(dispatch) {
     case resolve_body(pw, mesh_id) {
-      Ok(body) -> dispatch(to_msg(estoque.get_linear_velocity(body)))
+      Ok(body) ->
+        body
+        |> estoque.get_linear_velocity
+        |> vec3.from_tuple
+        |> to_msg
+        |> dispatch
       Error(_) -> Nil
     }
   })
@@ -496,11 +517,16 @@ pub fn get_linear_velocity(
 pub fn get_angular_velocity(
   pw: PhysicsWorld,
   mesh_id: String,
-  to_msg: fn(#(Float, Float, Float)) -> msg,
+  to_msg: fn(vec3.Vec3(Float)) -> msg,
 ) -> Effect(msg) {
   effect.from(fn(dispatch) {
     case resolve_body(pw, mesh_id) {
-      Ok(body) -> dispatch(to_msg(estoque.get_angular_velocity(body)))
+      Ok(body) ->
+        body
+        |> estoque.get_angular_velocity
+        |> vec3.from_tuple
+        |> to_msg
+        |> dispatch
       Error(_) -> Nil
     }
   })
@@ -515,7 +541,11 @@ pub fn is_sleeping(
 ) -> Effect(msg) {
   effect.from(fn(dispatch) {
     case resolve_body(pw, mesh_id) {
-      Ok(body) -> dispatch(to_msg(estoque.is_sleeping(body)))
+      Ok(body) ->
+        body
+        |> estoque.is_sleeping
+        |> to_msg
+        |> dispatch
       Error(_) -> Nil
     }
   })
@@ -531,11 +561,11 @@ pub fn is_sleeping(
 pub fn teleport(
   pw: PhysicsWorld,
   mesh_id: String,
-  x: Float,
-  y: Float,
-  z: Float,
+  position: vec3.Vec3(Float),
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, fn(body) { estoque.set_translation(body, x, y, z) })
+  with_body(pw, mesh_id, fn(body) {
+    estoque.set_translation(body, position.x, position.y, position.z)
+  })
 }
 
 /// Set the rotation of a body as a quaternion (x, y, z, w).
@@ -543,18 +573,21 @@ pub fn teleport(
 pub fn set_rotation(
   pw: PhysicsWorld,
   mesh_id: String,
-  qx: Float,
-  qy: Float,
-  qz: Float,
-  qw: Float,
+  rotation: quaternion.Quaternion,
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, fn(body) { estoque.set_rotation(body, qx, qy, qz, qw) })
+  with_body(pw, mesh_id, estoque.set_rotation(
+    _,
+    rotation.x,
+    rotation.y,
+    rotation.z,
+    rotation.w,
+  ))
 }
 
 /// Wake up a sleeping body so it resumes simulation.
 ///
 pub fn wake_up(pw: PhysicsWorld, mesh_id: String) -> Effect(msg) {
-  with_body(pw, mesh_id, fn(body) { estoque.wake_up(body) })
+  with_body(pw, mesh_id, estoque.wake_up)
 }
 
 /// Put a body to sleep, pausing its simulation.
@@ -563,7 +596,7 @@ pub fn wake_up(pw: PhysicsWorld, mesh_id: String) -> Effect(msg) {
 /// explicit `wake_up` call.
 ///
 pub fn sleep(pw: PhysicsWorld, mesh_id: String) -> Effect(msg) {
-  with_body(pw, mesh_id, fn(body) { estoque.sleep(body) })
+  with_body(pw, mesh_id, estoque.sleep)
 }
 
 // COLLISION HELPERS -----------------------------------------------------------
@@ -577,26 +610,11 @@ pub fn get_collisions_for(
   mesh_id: String,
 ) -> List(CollisionEvent) {
   pw.collision_events
-  |> list.filter(fn(info) { involves(info, mesh_id) })
+  |> list.filter(involves(_, mesh_id))
 }
 
-/// Check if a collision event involves a specific mesh ID.
-///
-pub fn involves(info: CollisionEvent, mesh_id: String) -> Bool {
+fn involves(info: CollisionEvent, mesh_id: String) -> Bool {
   info.mesh_id_a == Some(mesh_id) || info.mesh_id_b == Some(mesh_id)
-}
-
-/// Get the "other" mesh ID from a collision involving `mesh_id`.
-///
-/// Returns `None` if the event doesn't involve the given mesh,
-/// or if the other body has no registered mesh ID.
-///
-pub fn other_mesh(info: CollisionEvent, mesh_id: String) -> Option(String) {
-  case info.mesh_id_a, info.mesh_id_b {
-    Some(a), b if a == mesh_id -> b
-    a, Some(b) if b == mesh_id -> a
-    _, _ -> None
-  }
 }
 
 // RAYCASTING ------------------------------------------------------------------
@@ -610,7 +628,7 @@ pub fn other_mesh(info: CollisionEvent, mesh_id: String) -> Option(String) {
 ///
 pub fn cast_ray(
   pw: PhysicsWorld,
-  to_msg: fn(Option(RayHit)) -> msg,
+  to_msg: fn(Result(RayHit, Nil)) -> msg,
   origin origin: vec3.Vec3(Float),
   direction direction: vec3.Vec3(Float),
   max_distance max_distance: Float,
@@ -631,7 +649,7 @@ pub fn cast_ray(
   })
 }
 
-@external(javascript, "./cocoa.ffi.mjs", "castRay")
+@external(javascript, "./cacao.ffi.mjs", "castRay")
 fn do_cast_ray(
   pw: PhysicsWorld,
   origin_x: Float,
@@ -641,4 +659,4 @@ fn do_cast_ray(
   dir_y: Float,
   dir_z: Float,
   max_distance: Float,
-) -> Option(RayHit)
+) -> Result(RayHit, Nil)
