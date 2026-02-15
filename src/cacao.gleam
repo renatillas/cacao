@@ -11,7 +11,7 @@
 ////
 //// // In init — create the physics world
 //// fn init(_) {
-////   #(Model(physics: None), cacao.init(#(0.0, -9.81, 0.0), PhysicsReady))
+////   #(Model(physics: None), cacao.init(vec3.Vec3(0.0, -9.81, 0.0), PhysicsReady))
 //// }
 ////
 //// // In update — step physics on each tick
