@@ -5,12 +5,8 @@
 // This mirrors how estoque stores _eventQueue on the world.
 
 import { Result$Ok, Result$Error, toList } from "./gleam.mjs";
-import { Option$Some, Option$None, Option$isSome, Option$Some$0 } from "../gleam_stdlib/gleam/option.mjs";
-import {
-  setPosition,
-  setQuaternion,
-  getObject,
-} from "../tiramisu/tiramisu/internal/runtime.ffi.mjs";
+import { Option$Some, Option$None, } from "../gleam_stdlib/gleam/option.mjs";
+import { Vec3$Vec3 } from "../vec/vec/vec3.mjs";
 
 // Import Gleam constructors using the 1.13+ API
 import {
@@ -21,8 +17,8 @@ import {
   CollisionEventType$CollisionStopped,
   RayHit$RayHit,
 } from "./cacao.mjs";
-// Rapier module — loaded dynamically
-let RAPIER = null;
+
+import RAPIER from "@dimforge/rapier3d-compat";
 
 // === INITIALIZATION ===
 
@@ -30,28 +26,20 @@ let RAPIER = null;
  * Initialize Rapier WASM and create a physics world.
  * Called from Gleam inside effect.from — callback receives the PhysicsWorld.
  */
-export function init(gravity, callback) {
-  (async () => {
-    try {
-      const rapierModule = await import("@dimforge/rapier3d-compat");
-      await rapierModule.default.init();
-      RAPIER = rapierModule.default;
+export async function init(gravity, callback) {
+  await RAPIER.init();
 
-      const [gx, gy, gz] = gravity;
-      const world = new RAPIER.World({ x: gx, y: gy, z: gz });
+  const [gx, gy, gz] = gravity;
+  const world = new RAPIER.World({ x: gx, y: gy, z: gz });
 
-      // Attach registries and event queue to the world object
-      world._eventQueue = new RAPIER.EventQueue(true);
-      world._bodyRegistry = new Map(); // meshId -> RigidBodyHandle
-      world._colliderRegistry = new Map(); // meshId -> ColliderHandle
-      world._colliderToMeshId = new Map(); // colliderHandle (int) -> meshId
+  // Attach registries and event queue to the world object
+  world._eventQueue = new RAPIER.EventQueue(true);
+  world._bodyRegistry = new Map();
+  world._colliderRegistry = new Map();
+  world._colliderToMeshId = new Map();
 
-      const pw = PhysicsWorld$PhysicsWorld(world, toList([]));
-      callback(pw);
-    } catch (e) {
-      console.error("Cacao: Failed to initialize Rapier:", e);
-    }
-  })();
+  const pw = PhysicsWorld$PhysicsWorld(world, toList([]));
+  callback(pw);
 }
 
 // === STEP ===
@@ -145,7 +133,6 @@ export function resolveColliderToMesh(pw, colliderHandle) {
  * Cast a ray and return the closest hit with mesh ID resolved.
  */
 export function castRay(pw, originX, originY, originZ, dirX, dirY, dirZ, maxDistance) {
-  if (!RAPIER) return Result$Error();
 
   const world = PhysicsWorld$PhysicsWorld$world(pw);
   const ray = new RAPIER.Ray(
@@ -156,32 +143,42 @@ export function castRay(pw, originX, originY, originZ, dirX, dirY, dirZ, maxDist
   const hit = world.castRay(ray, maxDistance, true);
   if (hit === null || hit === undefined) return Result$Error();
 
-  // Compute hit point
-  const point = ray.pointAt(hit.toi);
+  const toi = hit.timeOfImpact;
+  if (toi === null || toi === undefined) return Result$Error();
 
-  // Compute hit normal
-  const collider = world.getCollider(hit.collider);
+  // Compute hit point
+  const point = ray.pointAt(toi);
+
+  // Compute Euclidean distance from origin to hit point
+  const dx = point.x - originX;
+  const dy = point.y - originY;
+  const dz = point.z - originZ;
+  const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+  // Get collider — hit.collider is already a Collider object from World.castRay
+  const collider = hit.collider;
   let normal = { x: 0, y: 1, z: 0 }; // default up
   if (collider) {
-    const normalResult = collider.castRayAndGetNormal(ray, hit.toi, true);
+    const normalResult = collider.castRayAndGetNormal(ray, toi, true);
     if (normalResult && normalResult.normal) {
       normal = normalResult.normal;
     }
   }
 
-  // Resolve collider → mesh ID using the registry on the world object
+  // Resolve collider → mesh ID using collider handle (integer key)
   let meshId = Option$None();
-  if (world._colliderToMeshId) {
-    const id = world._colliderToMeshId.get(hit.collider);
+  if (world._colliderToMeshId && collider) {
+    const handle = collider.handle;
+    const id = world._colliderToMeshId.get(handle);
     if (id) {
       meshId = Option$Some(id);
     }
   }
 
   return Result$Ok(RayHit$RayHit(
-    [point.x, point.y, point.z],
-    [normal.x, normal.y, normal.z],
-    hit.toi,
+    Vec3$Vec3(point.x, point.y, point.z),
+    Vec3$Vec3(normal.x, normal.y, normal.z),
+    distance,
     meshId
   ));
 }
@@ -254,7 +251,6 @@ function parseColliderString(str) {
  * Mutates the world's registry Maps in place.
  */
 function createBodyFromConfig(world, meshId, config) {
-  if (!RAPIER) return;
 
   // Create body descriptor
   let bodyDesc;
@@ -274,8 +270,8 @@ function createBodyFromConfig(world, meshId, config) {
 
   // Read initial position from Three.js
   const objOpt = getObject(meshId);
-  if (Option$isSome(objOpt)) {
-    const obj = Option$Some$0(objOpt);
+  if (objOpt) {
+    const obj = objOpt;
     bodyDesc.setTranslation(obj.position.x, obj.position.y, obj.position.z);
     bodyDesc.setRotation(obj.quaternion);
   }
@@ -401,4 +397,21 @@ function drainEvents(world) {
   });
 
   return toList(events);
+}
+
+// Three.js object access via DOM-stored references.
+// Tiramisu stores _object3d on each mesh's DOM element when registering it.
+function setPosition(meshId, x, y, z) {
+  const el = document.getElementById(meshId);
+  if (el?._object3d) el._object3d.position.set(x, y, z);
+}
+
+function setQuaternion(meshId, x, y, z, w) {
+  const el = document.getElementById(meshId);
+  if (el?._object3d) el._object3d.quaternion.set(x, y, z, w);
+}
+
+function getObject(meshId) {
+  const el = document.getElementById(meshId);
+  return el?._object3d;
 }

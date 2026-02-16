@@ -40,6 +40,7 @@
 // IMPORTS ---------------------------------------------------------------------
 
 import estoque
+import gleam/javascript/promise
 
 import gleam/bool
 import gleam/float
@@ -131,6 +132,7 @@ pub fn init(
 ) -> Effect(msg) {
   effect.from(fn(dispatch) {
     do_init(vec3.to_tuple(gravity), fn(pw) { dispatch(on_ready(pw)) })
+    Nil
   })
 }
 
@@ -138,7 +140,7 @@ pub fn init(
 fn do_init(
   gravity: #(Float, Float, Float),
   callback: fn(PhysicsWorld) -> Nil,
-) -> Nil
+) -> promise.Promise(Nil)
 
 // STEP ------------------------------------------------------------------------
 
@@ -624,7 +626,6 @@ fn involves(info: CollisionEvent, mesh_id: String) -> Bool {
 /// The ray starts at `origin` and travels in `direction` up to
 /// `max_distance` units.
 ///
-/// Returns `None` if nothing was hit.
 ///
 pub fn cast_ray(
   pw: PhysicsWorld,
