@@ -8,6 +8,5 @@ gleam_javascript = ">= 1.0.0 and < 2.0.0"
 lustre = ">= 5.3.5 and < 6.0.0"
 vec = ">= 3.0.1 and < 4.0.0"
 gleam_time = ">= 1.6.0 and < 2.0.0"
-tiramisu = { git = "https://github.com/renatillas/tiramisu", ref = "main" }
 estoque = { git = "https://github.com/renatillas/estoque", ref = "main" }
 quaterni = ">= 1.1.0 and < 2.0.0"
