@@ -10,3 +10,5 @@ vec = ">= 3.0.1 and < 4.0.0"
 gleam_time = ">= 1.6.0 and < 2.0.0"
 estoque = { git = "https://github.com/renatillas/estoque", ref = "main" }
 quaterni = ">= 1.1.0 and < 2.0.0"
+tiramisu = { path = "../tiramisu-web-component" }
+savoiardi = { path = "../savoiardi" }

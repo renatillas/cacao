@@ -1,74 +1,36 @@
-//// Cacao - Physics add-on for Tiramisu.
-////
-//// Provides Rapier physics integration as a hybrid library:
-//// declarative physics attributes on meshes in the view, imperative core for
-//// world management and stepping. No web component registration needed.
-////
-//// ## Usage
-////
-//// ```gleam
-//// import cacao
-////
-//// // In init — create the physics world
-//// fn init(_) {
-////   #(Model(physics: None), cacao.init(vec3.Vec3(0.0, -9.81, 0.0), PhysicsReady))
-//// }
-////
-//// // In update — step physics on each tick
-//// fn update(model, msg) {
-////   case msg {
-////     PhysicsReady(world) -> #(Model(physics: Some(world)), effect.none())
-////     Tick(_) -> {
-////       let world = cacao.step(model.physics)
-////       #(Model(..model, physics: world), effect.none())
-////     }
-////   }
-//// }
-////
-//// // In view — add physics attributes to meshes
-//// fn view(_model) {
-////   renderer.renderer([...], [
-////     mesh.mesh("player", [
-////       mesh.geometry_box(vec3.Vec3(1.0, 1.0, 1.0)),
-////       cacao.body_type(cacao.Dynamic),
-////       cacao.collider(cacao.Cuboid(0.5, 0.5, 0.5)),
-////     ], []),
-////   ])
-//// }
-//// ```
-
-// IMPORTS ---------------------------------------------------------------------
-
 import estoque
-import gleam/javascript/promise
-
 import gleam/bool
+import gleam/dict
 import gleam/float
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, Some}
-
+import gleam/result
+import gleam/string
 import lustre/attribute.{type Attribute}
 import lustre/effect.{type Effect}
-
 import quaternion
+import savoiardi.{type Object3D}
+import tiramisu/extension
 import vec/vec3
 
 // CORE TYPES ------------------------------------------------------------------
 
 /// Opaque physics state held in the user's Lustre model.
 ///
-/// Created with `init()`, updated with `step()`.
-/// Registries (body→handle, collider→mesh) are stored as JS Maps on the
-/// underlying Rapier world object for zero-cost per-frame access.
+/// Created with `init/3`, updated with `step/1`.
+/// Registries (body→handle, collider→mesh, Object3D refs) are stored as JS
+/// Maps on the underlying Rapier world object for zero-cost per-frame access.
+///
 pub type PhysicsWorld {
   PhysicsWorld(world: estoque.World, collision_events: List(CollisionEvent))
 }
 
 /// A collision event from the physics simulation.
 ///
-/// Populated during `step()` and read via `collision_events()` or
-/// `get_collisions_for()`.
+/// Populated during `step/1` and read via `collision_events` or
+/// `get_collisions_for/2`.
+///
 pub type CollisionEvent {
   CollisionEvent(
     mesh_id_a: Option(String),
@@ -114,7 +76,7 @@ pub type RayHit {
     normal: vec3.Vec3(Float),
     /// Distance from the ray origin to the hit point.
     distance: Float,
-    /// Mesh ID of the hit body, if it's registered in the body registry.
+    /// Mesh ID of the hit body, if registered in the body registry.
     mesh_id: Option(String),
   )
 }
@@ -123,37 +85,89 @@ pub type RayHit {
 
 /// Initialize Rapier WASM and create a physics world with the given gravity.
 ///
-/// The world is delivered asynchronously via the provided message constructor
-/// once Rapier WASM finishes loading.
+/// The world is stored in `holder` so the tiramisu extension hooks can create
+/// and remove bodies as the scene changes. The `on_ready` message is dispatched
+/// once the world is fully initialized.
 ///
 pub fn init(
   gravity: vec3.Vec3(Float),
-  on_ready: fn(PhysicsWorld) -> msg,
+  cacao_app: CacaoApp,
+  on_ready to_msg: fn(PhysicsWorld) -> msg,
 ) -> Effect(msg) {
-  effect.from(fn(dispatch) {
-    do_init(vec3.to_tuple(gravity), fn(pw) { dispatch(on_ready(pw)) })
-    Nil
-  })
+  use dispatch <- effect.from
+  use physics_world <- do_init(vec3.to_tuple(gravity))
+
+  do_set_world(cacao_app, physics_world)
+  physics_world
+  |> to_msg
+  |> dispatch
 }
+
+@external(javascript, "./cacao.ffi.mjs", "newWorldHolder")
+pub fn cacao_app() -> CacaoApp
 
 @external(javascript, "./cacao.ffi.mjs", "init")
 fn do_init(
   gravity: #(Float, Float, Float),
   callback: fn(PhysicsWorld) -> Nil,
-) -> promise.Promise(Nil)
+) -> Nil
+
+// EXTENSION -------------------------------------------------------------------
+
+/// Create the tiramisu extension that drives physics body lifecycle.
+///
+/// Register it with `tiramisu.register/1`. The same `WorldHolder` must be
+/// passed to `init/3` later to connect the hooks to the Rapier world.
+///
+pub fn extension(holder: CacaoApp) -> extension.Extension {
+  extension.AttributeExtension(
+    extension.Attribute(
+      observed_attributes: [
+        "physics-body",
+        "physics-collider",
+        "physics-friction",
+        "physics-restitution",
+        "physics-density",
+        "physics-sensor",
+        "physics-ccd",
+        "physics-linear-damping",
+        "physics-angular-damping",
+        "physics-lock-rotations",
+        "physics-collision-group",
+      ],
+      on_create: fn(_, id, object, attrs) {
+        dict.get(attrs, "physics-body")
+        |> result.map(create_body(holder, id, object, _, attrs))
+        |> result.unwrap(Nil)
+      },
+      on_update: fn(_, id, object, attrs) {
+        dict.get(attrs, "physics-body")
+        |> result.map_error(fn(_) { handle_remove(holder, id) })
+        |> result.map(fn(body) {
+          use <- bool.guard(is_body_id_registered(holder, id), Nil)
+          create_body(holder, id, object, body, attrs)
+        })
+        |> result.unwrap(Nil)
+      },
+      on_remove: fn(_, id) { handle_remove(holder, id) },
+      on_object_resolved: fn(_, id, object) {
+        handle_resolve(holder, id, object)
+      },
+    ),
+  )
+}
 
 // STEP ------------------------------------------------------------------------
 
 /// Step the physics simulation.
 ///
 /// On each call:
-/// 1. Auto-discovers meshes with `data-physics-body` attributes in the DOM
-/// 2. Creates/removes Rapier bodies to match
-/// 3. Steps the Rapier simulation
-/// 4. Drains collision events
-/// 5. Syncs body transforms back to Three.js
+/// 1. Steps the Rapier simulation
+/// 2. Drains collision events
+/// 3. Syncs body transforms back to Three.js via stored object references
 ///
-/// Returns the updated PhysicsWorld with fresh collision events.
+/// Physics bodies are managed automatically by the tiramisu extension hooks —
+/// no DOM scanning needed.
 ///
 pub fn step(pw: PhysicsWorld) -> PhysicsWorld {
   do_step(pw)
@@ -206,7 +220,7 @@ fn with_body(
 
 /// Mark a mesh as a physics body with the given type.
 ///
-/// Produces: `data-physics-body="dynamic|fixed|kinematic-position|kinematic-velocity"`
+/// Produces: `physics-body="dynamic|fixed|kinematic-position|kinematic-velocity"`
 ///
 pub fn body_type(bt: BodyType) -> Attribute(msg) {
   let value = case bt {
@@ -215,12 +229,12 @@ pub fn body_type(bt: BodyType) -> Attribute(msg) {
     KinematicPosition -> "kinematic-position"
     KinematicVelocity -> "kinematic-velocity"
   }
-  attribute.attribute("data-physics-body", value)
+  attribute.attribute("physics-body", value)
 }
 
 /// Set the collider shape for a physics body.
 ///
-/// Produces: `data-physics-collider="cuboid:hx,hy,hz"` or `"ball:r"` etc.
+/// Produces: `physics-collider="cuboid:hx,hy,hz"` or `"ball:r"` etc.
 ///
 pub fn collider(shape: ColliderShape) -> Attribute(msg) {
   let value = case shape {
@@ -245,42 +259,42 @@ pub fn collider(shape: ColliderShape) -> Attribute(msg) {
     Cone(half_height, radius) ->
       "cone:" <> float.to_string(half_height) <> "," <> float.to_string(radius)
   }
-  attribute.attribute("data-physics-collider", value)
+  attribute.attribute("physics-collider", value)
 }
 
 /// Set the friction coefficient.
 pub fn friction(value: Float) -> Attribute(msg) {
-  attribute.attribute("data-physics-friction", float.to_string(value))
+  attribute.attribute("physics-friction", float.to_string(value))
 }
 
 /// Set the restitution (bounciness).
 pub fn restitution(value: Float) -> Attribute(msg) {
-  attribute.attribute("data-physics-restitution", float.to_string(value))
+  attribute.attribute("physics-restitution", float.to_string(value))
 }
 
 /// Set the density.
 pub fn density(value: Float) -> Attribute(msg) {
-  attribute.attribute("data-physics-density", float.to_string(value))
+  attribute.attribute("physics-density", float.to_string(value))
 }
 
 /// Mark as a sensor (trigger volume, no physical collision).
 pub fn sensor(is_sensor: Bool) -> Attribute(msg) {
-  attribute.attribute("data-physics-sensor", bool.to_string(is_sensor))
+  attribute.attribute("physics-sensor", bool.to_string(is_sensor))
 }
 
 /// Enable continuous collision detection to prevent tunneling.
 pub fn ccd(enabled: Bool) -> Attribute(msg) {
-  attribute.attribute("data-physics-ccd", bool.to_string(enabled))
+  attribute.attribute("physics-ccd", bool.to_string(enabled))
 }
 
 /// Set linear damping (slows down linear velocity over time).
 pub fn linear_damping(value: Float) -> Attribute(msg) {
-  attribute.attribute("data-physics-linear-damping", float.to_string(value))
+  attribute.attribute("physics-linear-damping", float.to_string(value))
 }
 
 /// Set angular damping (slows down angular velocity over time).
 pub fn angular_damping(value: Float) -> Attribute(msg) {
-  attribute.attribute("data-physics-angular-damping", float.to_string(value))
+  attribute.attribute("physics-angular-damping", float.to_string(value))
 }
 
 /// Lock rotations around specific axes.
@@ -289,7 +303,7 @@ pub fn angular_damping(value: Float) -> Attribute(msg) {
 ///
 pub fn lock_rotations(x x: Bool, y y: Bool, z z: Bool) -> Attribute(msg) {
   attribute.attribute(
-    "data-physics-lock-rotations",
+    "physics-lock-rotations",
     bool.to_string(x) <> "," <> bool.to_string(y) <> "," <> bool.to_string(z),
   )
 }
@@ -301,7 +315,7 @@ pub fn lock_rotations(x x: Bool, y y: Bool, z z: Bool) -> Attribute(msg) {
 ///
 pub fn collision_group(membership m: Int, filter f: Int) -> Attribute(msg) {
   attribute.attribute(
-    "data-physics-collision-group",
+    "physics-collision-group",
     int.to_string(m) <> "," <> int.to_string(f),
   )
 }
@@ -331,12 +345,8 @@ pub fn apply_impulse(
   mesh_id: String,
   impulse: vec3.Vec3(Float),
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, estoque.apply_impulse(
-    _,
-    impulse.x,
-    impulse.y,
-    impulse.z,
-  ))
+  estoque.apply_impulse(_, impulse.x, impulse.y, impulse.z)
+  |> with_body(pw, mesh_id, _)
 }
 
 /// Apply a torque (rotational force) to a body.
@@ -348,7 +358,8 @@ pub fn apply_torque(
   mesh_id: String,
   torque: vec3.Vec3(Float),
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, estoque.apply_torque(_, torque.x, torque.y, torque.z))
+  estoque.apply_torque(_, torque.x, torque.y, torque.z)
+  |> with_body(pw, mesh_id, _)
 }
 
 /// Apply a torque impulse (instant angular velocity change) to a body.
@@ -358,12 +369,13 @@ pub fn apply_torque_impulse(
   mesh_id: String,
   torque_impulse: vec3.Vec3(Float),
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, estoque.apply_torque_impulse(
+  estoque.apply_torque_impulse(
     _,
     torque_impulse.x,
     torque_impulse.y,
     torque_impulse.z,
-  ))
+  )
+  |> with_body(pw, mesh_id, _)
 }
 
 /// Apply a force at a specific world-space point on the body.
@@ -376,17 +388,16 @@ pub fn apply_force_at_point(
   force force: vec3.Vec3(Float),
   point point: vec3.Vec3(Float),
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, fn(body) {
-    estoque.apply_force_at_point(
-      body,
-      force.x,
-      force.y,
-      force.z,
-      point.x,
-      point.y,
-      point.z,
-    )
-  })
+  estoque.apply_force_at_point(
+    _,
+    force.x,
+    force.y,
+    force.z,
+    point.x,
+    point.y,
+    point.z,
+  )
+  |> with_body(pw, mesh_id, _)
 }
 
 /// Apply an impulse at a specific world-space point on the body.
@@ -397,17 +408,16 @@ pub fn apply_impulse_at_point(
   impulse impulse: vec3.Vec3(Float),
   point point: vec3.Vec3(Float),
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, fn(body) {
-    estoque.apply_impulse_at_point(
-      body,
-      impulse.x,
-      impulse.y,
-      impulse.z,
-      point.x,
-      point.y,
-      point.z,
-    )
-  })
+  estoque.apply_impulse_at_point(
+    _,
+    impulse.x,
+    impulse.y,
+    impulse.z,
+    point.x,
+    point.y,
+    point.z,
+  )
+  |> with_body(pw, mesh_id, _)
 }
 
 // VELOCITY CONTROL ------------------------------------------------------------
@@ -422,14 +432,13 @@ pub fn set_linear_velocity(
   mesh_id: String,
   linear_velocity: vec3.Vec3(Float),
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, fn(body) {
-    estoque.set_linear_velocity(
-      body,
-      linear_velocity.x,
-      linear_velocity.y,
-      linear_velocity.z,
-    )
-  })
+  estoque.set_linear_velocity(
+    _,
+    linear_velocity.x,
+    linear_velocity.y,
+    linear_velocity.z,
+  )
+  |> with_body(pw, mesh_id, _)
 }
 
 /// Set the angular velocity of a body directly.
@@ -439,39 +448,37 @@ pub fn set_angular_velocity(
   mesh_id: String,
   angular_velocity: vec3.Vec3(Float),
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, fn(body) {
-    estoque.set_angular_velocity(
-      body,
-      angular_velocity.x,
-      angular_velocity.y,
-      angular_velocity.z,
-    )
-  })
+  estoque.set_angular_velocity(
+    _,
+    angular_velocity.x,
+    angular_velocity.y,
+    angular_velocity.z,
+  )
+  |> with_body(pw, mesh_id, _)
 }
 
 // BODY STATE QUERIES ----------------------------------------------------------
 
 /// Get the world-space position of a body.
 ///
-/// Dispatches the position as `#(Float, Float, Float)` to the provided
-/// message constructor. Silently skipped if the body is not found.
+/// Dispatches the position to the provided message constructor.
+/// Silently skipped if the body is not found.
 ///
 pub fn get_position(
   pw: PhysicsWorld,
   mesh_id: String,
   to_msg: fn(vec3.Vec3(Float)) -> msg,
 ) -> Effect(msg) {
-  effect.from(fn(dispatch) {
-    case resolve_body(pw, mesh_id) {
-      Ok(body) ->
-        body
-        |> estoque.get_translation
-        |> vec3.from_tuple
-        |> to_msg
-        |> dispatch
-      Error(_) -> Nil
-    }
-  })
+  use dispatch <- effect.from
+  case resolve_body(pw, mesh_id) {
+    Ok(body) ->
+      body
+      |> estoque.get_translation
+      |> vec3.from_tuple
+      |> to_msg
+      |> dispatch
+    Error(_) -> Nil
+  }
 }
 
 /// Get the rotation of a body as a quaternion (x, y, z, w).
@@ -481,17 +488,16 @@ pub fn get_rotation(
   mesh_id: String,
   to_msg: fn(quaternion.Quaternion) -> msg,
 ) -> Effect(msg) {
-  effect.from(fn(dispatch) {
-    case resolve_body(pw, mesh_id) {
-      Ok(body) ->
-        body
-        |> estoque.get_rotation
-        |> quaternion.from_tuple
-        |> to_msg
-        |> dispatch
-      Error(_) -> Nil
-    }
-  })
+  use dispatch <- effect.from
+  case resolve_body(pw, mesh_id) {
+    Ok(body) ->
+      body
+      |> estoque.get_rotation
+      |> quaternion.from_tuple
+      |> to_msg
+      |> dispatch
+    Error(_) -> Nil
+  }
 }
 
 /// Get the linear velocity of a body.
@@ -501,17 +507,16 @@ pub fn get_linear_velocity(
   mesh_id: String,
   to_msg: fn(vec3.Vec3(Float)) -> msg,
 ) -> Effect(msg) {
-  effect.from(fn(dispatch) {
-    case resolve_body(pw, mesh_id) {
-      Ok(body) ->
-        body
-        |> estoque.get_linear_velocity
-        |> vec3.from_tuple
-        |> to_msg
-        |> dispatch
-      Error(_) -> Nil
-    }
-  })
+  use dispatch <- effect.from
+  case resolve_body(pw, mesh_id) {
+    Ok(body) ->
+      body
+      |> estoque.get_linear_velocity
+      |> vec3.from_tuple
+      |> to_msg
+      |> dispatch
+    Error(_) -> Nil
+  }
 }
 
 /// Get the angular velocity of a body.
@@ -521,17 +526,16 @@ pub fn get_angular_velocity(
   mesh_id: String,
   to_msg: fn(vec3.Vec3(Float)) -> msg,
 ) -> Effect(msg) {
-  effect.from(fn(dispatch) {
-    case resolve_body(pw, mesh_id) {
-      Ok(body) ->
-        body
-        |> estoque.get_angular_velocity
-        |> vec3.from_tuple
-        |> to_msg
-        |> dispatch
-      Error(_) -> Nil
-    }
-  })
+  use dispatch <- effect.from
+  case resolve_body(pw, mesh_id) {
+    Ok(body) ->
+      body
+      |> estoque.get_angular_velocity
+      |> vec3.from_tuple
+      |> to_msg
+      |> dispatch
+    Error(_) -> Nil
+  }
 }
 
 /// Check if a body is sleeping (not being simulated).
@@ -541,16 +545,15 @@ pub fn is_sleeping(
   mesh_id: String,
   to_msg: fn(Bool) -> msg,
 ) -> Effect(msg) {
-  effect.from(fn(dispatch) {
-    case resolve_body(pw, mesh_id) {
-      Ok(body) ->
-        body
-        |> estoque.is_sleeping
-        |> to_msg
-        |> dispatch
-      Error(_) -> Nil
-    }
-  })
+  use dispatch <- effect.from
+  case resolve_body(pw, mesh_id) {
+    Ok(body) ->
+      body
+      |> estoque.is_sleeping
+      |> to_msg
+      |> dispatch
+    Error(_) -> Nil
+  }
 }
 
 // BODY STATE WRITES -----------------------------------------------------------
@@ -565,9 +568,8 @@ pub fn teleport(
   mesh_id: String,
   position: vec3.Vec3(Float),
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, fn(body) {
-    estoque.set_translation(body, position.x, position.y, position.z)
-  })
+  estoque.set_translation(_, position.x, position.y, position.z)
+  |> with_body(pw, mesh_id, _)
 }
 
 /// Set the rotation of a body as a quaternion (x, y, z, w).
@@ -577,13 +579,8 @@ pub fn set_rotation(
   mesh_id: String,
   rotation: quaternion.Quaternion,
 ) -> Effect(msg) {
-  with_body(pw, mesh_id, estoque.set_rotation(
-    _,
-    rotation.x,
-    rotation.y,
-    rotation.z,
-    rotation.w,
-  ))
+  estoque.set_rotation(_, rotation.x, rotation.y, rotation.z, rotation.w)
+  |> with_body(pw, mesh_id, _)
 }
 
 /// Wake up a sleeping body so it resumes simulation.
@@ -626,7 +623,6 @@ fn involves(info: CollisionEvent, mesh_id: String) -> Bool {
 /// The ray starts at `origin` and travels in `direction` up to
 /// `max_distance` units.
 ///
-///
 pub fn cast_ray(
   pw: PhysicsWorld,
   to_msg: fn(Result(RayHit, Nil)) -> msg,
@@ -634,20 +630,19 @@ pub fn cast_ray(
   direction direction: vec3.Vec3(Float),
   max_distance max_distance: Float,
 ) -> Effect(msg) {
-  effect.from(fn(dispatch) {
-    let result =
-      do_cast_ray(
-        pw,
-        origin.x,
-        origin.y,
-        origin.z,
-        direction.x,
-        direction.y,
-        direction.z,
-        max_distance,
-      )
-    dispatch(to_msg(result))
-  })
+  use dispatch <- effect.from
+  do_cast_ray(
+    pw,
+    origin.x,
+    origin.y,
+    origin.z,
+    direction.x,
+    direction.y,
+    direction.z,
+    max_distance,
+  )
+  |> to_msg
+  |> dispatch
 }
 
 @external(javascript, "./cacao.ffi.mjs", "castRay")
@@ -661,3 +656,160 @@ fn do_cast_ray(
   dir_z: Float,
   max_distance: Float,
 ) -> Result(RayHit, Nil)
+
+// WORLD HOLDER ----------------------------------------------------------------
+
+/// Mutable holder that connects the tiramisu extension hooks to the Rapier
+/// physics world.
+///
+/// Create with `world/0`, register via `extension/1`, then pass to `init/3`.
+/// Also forwarded to the Lustre app as flags so `init` can call `cacao.init`.
+///
+pub type CacaoApp
+
+@external(javascript, "./cacao.ffi.mjs", "setWorld")
+fn do_set_world(holder: CacaoApp, pw: PhysicsWorld) -> Nil
+
+@external(javascript, "./cacao.ffi.mjs", "handleCreate")
+fn do_handle_create(
+  holder: CacaoApp,
+  id: String,
+  object: Option(Object3D),
+  body_type: String,
+  collider_type: String,
+  collider_p0: Float,
+  collider_p1: Float,
+  collider_p2: Float,
+  friction: Float,
+  restitution: Float,
+  density: Float,
+  is_sensor: Bool,
+  ccd: Bool,
+  linear_damping: Float,
+  angular_damping: Float,
+  lock_x: Bool,
+  lock_y: Bool,
+  lock_z: Bool,
+  has_collision_group: Bool,
+  collision_membership: Int,
+  collision_filter: Int,
+) -> Nil
+
+@external(javascript, "./cacao.ffi.mjs", "handleRemove")
+fn handle_remove(holder: CacaoApp, id: String) -> Nil
+
+@external(javascript, "./cacao.ffi.mjs", "handleResolved")
+fn handle_resolve(holder: CacaoApp, id: String, object: Object3D) -> Nil
+
+@external(javascript, "./cacao.ffi.mjs", "bodyExists")
+fn is_body_id_registered(holder: CacaoApp, id: String) -> Bool
+
+/// Parse attrs dict and call the FFI body creation function.
+fn create_body(
+  holder: CacaoApp,
+  id: String,
+  object: Option(Object3D),
+  body_type: String,
+  attrs: dict.Dict(String, String),
+) -> Nil {
+  let collider =
+    dict.get(attrs, "physics-collider")
+    |> result.unwrap("cuboid:0.5,0.5,0.5")
+  let #(collider_type, p0, p1, p2) = parse_collider(collider)
+
+  let #(lock_x, lock_y, lock_z) =
+    dict.get(attrs, "physics-lock-rotations")
+    |> result.unwrap("False,False,False")
+    |> parse_lock_rotations
+
+  let #(has_cg, cg_membership, cg_filter) =
+    dict.get(attrs, "physics-collision-group")
+    |> option.from_result
+    |> parse_collision_group
+
+  do_handle_create(
+    holder,
+    id,
+    object,
+    body_type,
+    collider_type,
+    p0,
+    p1,
+    p2,
+    dict.get(attrs, "physics-friction")
+      |> result.try(float.parse)
+      |> result.unwrap(0.5),
+    dict.get(attrs, "physics-restitution")
+      |> result.try(float.parse)
+      |> result.unwrap(0.0),
+    dict.get(attrs, "physics-density")
+      |> result.try(float.parse)
+      |> result.unwrap(1.0),
+    dict.get(attrs, "physics-sensor")
+    |> result.unwrap("False")
+      == "True",
+    dict.get(attrs, "physics-ccd")
+    |> result.unwrap("False")
+      == "True",
+    dict.get(attrs, "physics-linear-damping")
+      |> result.try(float.parse)
+      |> result.unwrap(0.0),
+    dict.get(attrs, "physics-angular-damping")
+      |> result.try(float.parse)
+      |> result.unwrap(0.0),
+    lock_x,
+    lock_y,
+    lock_z,
+    has_cg,
+    cg_membership,
+    cg_filter,
+  )
+}
+
+/// Parse a collider string like "cuboid:0.5,0.5,0.5" or "ball:0.5".
+fn parse_collider(s: String) -> #(String, Float, Float, Float) {
+  case string.split(s, ":") {
+    [kind, params] ->
+      case string.split(params, ",") {
+        [p0] -> #(kind, float.parse(p0) |> result.unwrap(0.5), 0.0, 0.0)
+        [p0, p1] -> #(
+          kind,
+          float.parse(p0) |> result.unwrap(0.5),
+          float.parse(p1) |> result.unwrap(0.5),
+          0.0,
+        )
+        [p0, p1, p2, ..] -> #(
+          kind,
+          float.parse(p0) |> result.unwrap(0.5),
+          float.parse(p1) |> result.unwrap(0.5),
+          float.parse(p2) |> result.unwrap(0.5),
+        )
+        _ -> #("cuboid", 0.5, 0.5, 0.5)
+      }
+    _ -> #("cuboid", 0.5, 0.5, 0.5)
+  }
+}
+
+/// Parse a lock-rotations string like "True,False,True".
+fn parse_lock_rotations(s: String) -> #(Bool, Bool, Bool) {
+  case string.split(s, ",") {
+    [x, y, z] -> #(x == "True", y == "True", z == "True")
+    _ -> #(False, False, False)
+  }
+}
+
+/// Parse an optional collision group string like "4,7".
+fn parse_collision_group(s: Option(String)) -> #(Bool, Int, Int) {
+  case s {
+    option.None -> #(False, 0, 0)
+    option.Some(str) ->
+      case string.split(str, ",") {
+        [m, f] -> #(
+          True,
+          int.parse(m) |> result.unwrap(0),
+          int.parse(f) |> result.unwrap(0),
+        )
+        _ -> #(False, 0, 0)
+      }
+  }
+}

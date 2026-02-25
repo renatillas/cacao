@@ -1,11 +1,21 @@
-// Cacao FFI — Physics world management, auto-discovery, Three.js sync, and raycasting.
+// Cacao FFI — Physics world management, extension hooks, and raycasting.
 //
-// Registries (_bodyRegistry, _colliderRegistry, _colliderToMeshId) are stored
-// as JS Maps directly on the Rapier world object for zero-cost per-frame access.
-// This mirrors how estoque stores _eventQueue on the world.
+// Bodies are created/destroyed in response to tiramisu extension lifecycle
+// hooks (handleCreate, handleRemove, handleResolved) rather than per-frame
+// DOM scanning. Three.js object references are stored in _objectRegistry on
+// the world for direct transform sync during step() without DOM access.
+//
+// The WorldHolder acts as a bridge between the tiramisu extension (registered
+// at startup) and the Rapier world (initialized asynchronously). Pending
+// configs are queued in the holder until the world is ready.
 
 import { Result$Ok, Result$Error, toList } from "./gleam.mjs";
-import { Option$Some, Option$None, } from "../gleam_stdlib/gleam/option.mjs";
+import {
+  Option$Some,
+  Option$None,
+  Option$isSome,
+  Option$Some$0
+} from "../gleam_stdlib/gleam/option.mjs";
 import { Vec3$Vec3 } from "../vec/vec/vec3.mjs";
 
 // Import Gleam constructors using the 1.13+ API
@@ -19,6 +29,56 @@ import {
 } from "./cacao.mjs";
 
 import RAPIER from "@dimforge/rapier3d-compat";
+
+// === WORLD HOLDER ===
+
+/**
+ * Create a new world holder.
+ *
+ * The holder bridges the extension hooks (registered at startup) and the
+ * Rapier world (initialized asynchronously via init()).
+ *
+ * _pendingConfigs: meshId → physics config, queued when world or object
+ *                  is not yet available.
+ * _resolvedObjects: meshId → Object3D, stored when the object resolves
+ *                   before the body can be created.
+ */
+export function newWorldHolder() {
+  return {
+    world: null,
+    _pendingConfigs: new Map(),
+    _resolvedObjects: new Map(),
+  };
+}
+
+/**
+ * Connect the initialized Rapier world to the holder.
+ *
+ * Called by cacao.init() once Rapier WASM loads. Flushes any pending
+ * body configs that arrived via extension hooks before init() completed.
+ */
+export function setWorld(holder, pw) {
+  const world = PhysicsWorld$PhysicsWorld$world(pw);
+
+  // Initialize the Object3D reference registry for direct transform sync
+  world._objectRegistry = world._objectRegistry || new Map();
+  holder.world = world;
+
+  // Flush pending creates: entries where both config and resolved object exist
+  for (const [meshId, config] of holder._pendingConfigs) {
+    if (world._bodyRegistry.has(meshId)) continue;
+
+    const obj = holder._resolvedObjects.get(meshId);
+    if (obj) {
+      // Both config and object available — create body now
+      createBodyFromConfig(world, meshId, config, obj);
+      world._objectRegistry.set(meshId, obj);
+      holder._resolvedObjects.delete(meshId);
+      holder._pendingConfigs.delete(meshId);
+    }
+    // If no object yet (async mesh): leave in _pendingConfigs for handleResolved
+  }
+}
 
 // === INITIALIZATION ===
 
@@ -37,6 +97,8 @@ export async function init(gravity, callback) {
   world._bodyRegistry = new Map();
   world._colliderRegistry = new Map();
   world._colliderToMeshId = new Map();
+  // Object3D references for direct transform sync (populated via extension hooks)
+  world._objectRegistry = new Map();
 
   const pw = PhysicsWorld$PhysicsWorld(world, toList([]));
   callback(pw);
@@ -46,57 +108,138 @@ export async function init(gravity, callback) {
 
 /**
  * Step the physics simulation:
- * 1. Auto-discover bodies from DOM
- * 2. Create/remove Rapier bodies
- * 3. Step Rapier
- * 4. Drain collision events
- * 5. Sync transforms to Three.js
+ * 1. Step Rapier
+ * 2. Drain collision events
+ * 3. Sync body transforms to Three.js via stored object references
+ *
+ * Bodies are tracked via extension hooks — no DOM scanning needed.
  */
 export function step(pw) {
   const world = PhysicsWorld$PhysicsWorld$world(pw);
 
-  // 1. Auto-discover bodies from DOM
-  const domBodies = document.querySelectorAll("[data-physics-body]");
-  const domMeshIds = new Set();
-
-  for (const el of domBodies) {
-    const meshId = el.id;
-    if (!meshId) continue;
-    domMeshIds.add(meshId);
-
-    // New mesh — create body
-    if (!world._bodyRegistry.has(meshId)) {
-      const config = parsePhysicsAttributes(el);
-      createBodyFromConfig(world, meshId, config);
-    }
-  }
-
-  // Remove bodies for meshes no longer in DOM
-  for (const [meshId, handle] of world._bodyRegistry) {
-    if (!domMeshIds.has(meshId)) {
-      destroyBody(world, meshId, handle);
-    }
-  }
-
-  // 2. Step Rapier
+  // Step Rapier simulation
   world.step(world._eventQueue);
 
-  // 3. Drain collision events
+  // Drain collision events
   const events = drainEvents(world);
 
-  // 4. Sync transforms to Three.js
+  // Sync transforms from Rapier → Three.js using stored object references
   for (const [meshId, handle] of world._bodyRegistry) {
     const body = world.getRigidBody(handle);
     if (!body) continue;
 
+    // Use stored Object3D reference — avoids DOM lookup per frame
+    const obj = world._objectRegistry?.get(meshId);
+    if (!obj) continue; // Object not yet resolved (async mesh still loading)
+
     const t = body.translation();
     const r = body.rotation();
-    setPosition(meshId, t.x, t.y, t.z);
-    setQuaternion(meshId, r.x, r.y, r.z, r.w);
+    obj.position.set(t.x, t.y, t.z);
+    obj.quaternion.set(r.x, r.y, r.z, r.w);
   }
 
-  // 5. Return updated PhysicsWorld
   return PhysicsWorld$PhysicsWorld(world, events);
+}
+
+// === BODY LIFECYCLE (extension hooks) ===
+
+/**
+ * Called by the tiramisu on_create hook when a scene node with
+ * data-physics-body appears. Physics config is fully parsed on the
+ * Gleam side — only raw values arrive here.
+ *
+ * Creates the Rapier body immediately if the world is ready and the
+ * Object3D is available. Otherwise queues for later.
+ */
+export function handleCreate(
+  holder, id, objectOrNone,
+  bodyType, colliderType, p0, p1, p2,
+  friction, restitution, density,
+  isSensor, ccd, linearDamping, angularDamping,
+  lockX, lockY, lockZ,
+  hasCg, cgMembership, cgFilter
+) {
+  const config = {
+    bodyType,
+    collider: { type: colliderType, params: [p0, p1, p2] },
+    friction, restitution, density,
+    isSensor, ccdEnabled: ccd,
+    linearDamping, angularDamping,
+    lockRotations: [lockX, lockY, lockZ],
+    collisionGroup: hasCg ? [cgMembership, cgFilter] : null,
+  };
+
+  const obj = fromGleamOption(objectOrNone);
+  const world = holder.world;
+
+  if (world && obj) {
+    // Best case: world ready and object available
+    if (!world._bodyRegistry.has(id)) {
+      createBodyFromConfig(world, id, config, obj);
+      world._objectRegistry.set(id, obj);
+    }
+  } else if (world && !obj) {
+    // World ready but mesh is async — queue config for handleResolved
+    holder._pendingConfigs.set(id, config);
+  } else if (!world && obj) {
+    // Object available but world not ready yet — queue for setWorld
+    holder._pendingConfigs.set(id, config);
+    holder._resolvedObjects.set(id, obj);
+  } else {
+    // Neither world nor object ready — queue config for both
+    holder._pendingConfigs.set(id, config);
+  }
+}
+
+/**
+ * Called by the tiramisu on_remove hook when a scene node is removed.
+ * Destroys the Rapier body and cleans up all registries.
+ */
+export function handleRemove(holder, id) {
+  // Clean up pending state regardless of world readiness
+  holder._pendingConfigs.delete(id);
+  holder._resolvedObjects.delete(id);
+
+  const world = holder.world;
+  if (!world || !world._bodyRegistry.has(id)) return;
+
+  const handle = world._bodyRegistry.get(id);
+  destroyBody(world, id, handle);
+  world._objectRegistry?.delete(id);
+}
+
+/**
+ * Called by the tiramisu on_object_resolved hook when an async GLB/FBX/OBJ
+ * mesh finishes loading. Stores the Object3D reference and creates the
+ * pending physics body if the world is ready.
+ */
+export function handleResolved(holder, id, object) {
+  const world = holder.world;
+
+  if (world) {
+    // World is ready — store object reference for transform sync
+    world._objectRegistry = world._objectRegistry || new Map();
+    world._objectRegistry.set(id, object);
+
+    // Create body if config was queued waiting for this object
+    if (holder._pendingConfigs.has(id) && !world._bodyRegistry.has(id)) {
+      const config = holder._pendingConfigs.get(id);
+      holder._pendingConfigs.delete(id);
+      createBodyFromConfig(world, id, config, object);
+    }
+  } else {
+    // World not ready — store resolved object so setWorld can use it
+    holder._resolvedObjects.set(id, object);
+  }
+}
+
+/**
+ * Check whether a physics body exists for the given mesh ID.
+ * Used in on_update to avoid re-creating existing bodies.
+ */
+export function bodyExists(holder, id) {
+  if (!holder.world) return false;
+  return holder.world._bodyRegistry.has(id);
 }
 
 // === BODY RESOLUTION ===
@@ -133,7 +276,6 @@ export function resolveColliderToMesh(pw, colliderHandle) {
  * Cast a ray and return the closest hit with mesh ID resolved.
  */
 export function castRay(pw, originX, originY, originZ, dirX, dirY, dirZ, maxDistance) {
-
   const world = PhysicsWorld$PhysicsWorld$world(pw);
   const ray = new RAPIER.Ray(
     { x: originX, y: originY, z: originZ },
@@ -186,72 +328,20 @@ export function castRay(pw, originX, originY, originZ, dirX, dirY, dirZ, maxDist
 // === INTERNAL HELPERS ===
 
 /**
- * Parse data-physics-* attributes from a DOM element.
+ * Extract a value from a Gleam Option.
+ * Returns the contained value for Some, or null for None.
+ *
  */
-function parsePhysicsAttributes(el) {
-  const bodyType = el.getAttribute("data-physics-body") || "dynamic";
-  const colliderStr = el.getAttribute("data-physics-collider") || "cuboid:0.5,0.5,0.5";
-  const collider = parseColliderString(colliderStr);
-
-  const friction = parseFloat(el.getAttribute("data-physics-friction")) || 0.5;
-  const restitution = parseFloat(el.getAttribute("data-physics-restitution")) || 0.0;
-  const density = parseFloat(el.getAttribute("data-physics-density")) || 1.0;
-  const isSensor = el.getAttribute("data-physics-sensor") === "True";
-  const ccdEnabled = el.getAttribute("data-physics-ccd") === "True";
-  const linearDamping = parseFloat(el.getAttribute("data-physics-linear-damping")) || 0.0;
-  const angularDamping = parseFloat(el.getAttribute("data-physics-angular-damping")) || 0.0;
-
-  // Parse lock rotations: "True,False,True"
-  let lockRotations = [false, false, false];
-  const lockStr = el.getAttribute("data-physics-lock-rotations");
-  if (lockStr) {
-    lockRotations = lockStr.split(",").map((p) => p.trim() === "True");
-  }
-
-  // Parse collision group: "membership,filter"
-  let collisionGroup = null;
-  const cgStr = el.getAttribute("data-physics-collision-group");
-  if (cgStr) {
-    const parts = cgStr.split(",");
-    if (parts.length === 2) {
-      collisionGroup = [parseInt(parts[0]), parseInt(parts[1])];
-    }
-  }
-
-  return {
-    bodyType,
-    collider,
-    friction,
-    restitution,
-    density,
-    isSensor,
-    ccdEnabled,
-    linearDamping,
-    angularDamping,
-    lockRotations,
-    collisionGroup,
-  };
+function fromGleamOption(opt) {
+  return Option$isSome(opt) ? Option$Some$0(opt) : null;
 }
 
 /**
- * Parse a collider string like "cuboid:0.5,0.5,0.5" or "ball:0.5"
- */
-function parseColliderString(str) {
-  const colonIdx = str.indexOf(":");
-  if (colonIdx === -1) return { type: "cuboid", params: [0.5, 0.5, 0.5] };
-
-  const type = str.substring(0, colonIdx);
-  const params = str.substring(colonIdx + 1).split(",").map(Number);
-
-  return { type, params };
-}
-
-/**
- * Create a Rapier body + collider from a parsed config object.
+ * Create a Rapier rigid body + collider from a parsed config object.
+ * Takes the Three.js object for initial position/rotation.
  * Mutates the world's registry Maps in place.
  */
-function createBodyFromConfig(world, meshId, config) {
-
+function createBodyFromConfig(world, meshId, config, obj) {
   // Create body descriptor
   let bodyDesc;
   switch (config.bodyType) {
@@ -268,10 +358,8 @@ function createBodyFromConfig(world, meshId, config) {
       bodyDesc = RAPIER.RigidBodyDesc.dynamic();
   }
 
-  // Read initial position from Three.js
-  const objOpt = getObject(meshId);
-  if (objOpt) {
-    const obj = objOpt;
+  // Set initial position/rotation from the Three.js object
+  if (obj) {
     bodyDesc.setTranslation(obj.position.x, obj.position.y, obj.position.z);
     bodyDesc.setRotation(obj.quaternion);
   }
@@ -334,10 +422,6 @@ function createBodyFromConfig(world, meshId, config) {
   const colliderHandle = collider.handle;
   world._colliderRegistry.set(meshId, colliderHandle);
   world._colliderToMeshId.set(colliderHandle, meshId);
-
-  // Set physics-controlled attribute on the DOM element
-  const el = document.getElementById(meshId);
-  if (el) el.setAttribute("physics-controlled", "");
 }
 
 /**
@@ -359,10 +443,6 @@ function destroyBody(world, meshId, handle) {
 
   world._bodyRegistry.delete(meshId);
   world._colliderRegistry.delete(meshId);
-
-  // Unset physics-controlled on the DOM element
-  const el = document.getElementById(meshId);
-  if (el) el.removeAttribute("physics-controlled");
 }
 
 /**
@@ -397,21 +477,4 @@ function drainEvents(world) {
   });
 
   return toList(events);
-}
-
-// Three.js object access via DOM-stored references.
-// Tiramisu stores _object3d on each mesh's DOM element when registering it.
-function setPosition(meshId, x, y, z) {
-  const el = document.getElementById(meshId);
-  if (el?._object3d) el._object3d.position.set(x, y, z);
-}
-
-function setQuaternion(meshId, x, y, z, w) {
-  const el = document.getElementById(meshId);
-  if (el?._object3d) el._object3d.quaternion.set(x, y, z, w);
-}
-
-function getObject(meshId) {
-  const el = document.getElementById(meshId);
-  return el?._object3d;
 }
